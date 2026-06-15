@@ -32,6 +32,10 @@ async function init() {
   statusText.textContent = "Loading terminal emulator...";
   try {
     await terminal.load("/ghostty-vt.wasm");
+    // Wire terminal→PTY writes back to the WebSocket
+    terminal.setWriteCallback((data: Uint8Array) => {
+      transport.send(data);
+    });
   } catch (err) {
     console.warn("[app] WASM load error:", err);
   }

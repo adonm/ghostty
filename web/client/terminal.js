@@ -79,6 +79,11 @@ interface GhosttyVtExports {
   ghostty_mouse_encoder_encode(
     enc: number, ev: number, out_ptr: number, out_len: number,
   ): number;
+
+  // WASM write buffer (DSR/DA responses)
+  ghostty_wasm_terminal_set_write_buf(t: number): void;
+  ghostty_wasm_write_buf: number; // pointer to buffer
+  ghostty_wasm_write_buf_len: number; // pointer to length (usize)
 }
 
 export interface Cell {
@@ -122,6 +127,12 @@ export class Terminal {
   private loaded = false;
   private textBuffer = "";
   private initialized = false;
+  private writeCb: ((data: Uint8Array) => void) | null = null;
+
+  /** Set a callback for terminal→PTY write data (DSR responses, etc.) */
+  setWriteCallback(cb: (data: Uint8Array) => void): void {
+    this.writeCb = cb;
+  }
 
   async load(wasmUrl?: string): Promise<void> {
     const url = wasmUrl ?? "/ghostty-vt.wasm";
@@ -156,26 +167,49 @@ export class Terminal {
   private init(): void {
     if (!this.loaded || !this.wasm) return;
 
-    // Create terminal
-    this.tPtr = this.wasm.ghostty_terminal_new(0); // NULL allocator = default
+    // Allocate space for the output terminal pointer (4 bytes)
+    const resultPtr = this.wasm.ghostty_wasm_alloc_u8(4);
+    if (!resultPtr) { console.error("[terminal] alloc failed"); return; }
+
+    // Options struct: cols (u16), rows (u16), max_scrollback (u32) = 8 bytes
+    const optsPtr = this.wasm.ghostty_alloc(8);
+    new Uint16Array(this.mem!.buffer, optsPtr, 2).set([this.cols, this.rows]);
+    new Uint32Array(this.mem!.buffer, optsPtr + 4, 1).set([1000]);
+
+    const r = this.wasm.ghostty_terminal_new(0, resultPtr, optsPtr);
+    this.wasm.ghostty_free(optsPtr);
+
+    if (r !== 0) {
+      console.error("[terminal] terminal_new failed:", r);
+      this.wasm.ghostty_free(resultPtr);
+      this.loaded = false;
+      return;
+    }
+
+    this.tPtr = new Uint32Array(this.mem!.buffer, resultPtr, 1)[0];
+    this.wasm.ghostty_free(resultPtr);
+
     if (!this.tPtr) {
-      console.error("[terminal] failed to create terminal");
+      console.error("[terminal] terminal ptr is null");
       this.loaded = false;
       return;
     }
 
     // Create render state
-    const rsBuf = new Uint32Array(1);
-    this.wasm.ghostty_render_state_new(0, this.ptrOf(rsBuf));
-    this.rsPtr = rsBuf[0];
-    if (!this.rsPtr) {
-      console.warn("[terminal] render state creation failed");
+    const rsResultPtr = this.wasm.ghostty_alloc(4);
+    const rsR = this.wasm.ghostty_render_state_new(0, rsResultPtr);
+    if (rsR === 0) {
+      this.rsPtr = new Uint32Array(this.mem!.buffer, rsResultPtr, 1)[0];
     }
+    this.wasm.ghostty_free(rsResultPtr);
 
     // Create formatter
-    const fmtBuf = new Uint32Array(1);
-    this.wasm.ghostty_formatter_terminal_new(0, this.tPtr, this.ptrOf(fmtBuf));
-    this.fmtPtr = fmtBuf[0];
+    const fmtResultPtr = this.wasm.ghostty_alloc(4);
+    const fmtR = this.wasm.ghostty_formatter_terminal_new(0, this.tPtr, fmtResultPtr);
+    if (fmtR === 0) {
+      this.fmtPtr = new Uint32Array(this.mem!.buffer, fmtResultPtr, 1)[0];
+    }
+    this.wasm.ghostty_free(fmtResultPtr);
 
     // Create key encoder + event
     this.keyEvPtr = this.wasm.ghostty_key_event_new();
@@ -184,10 +218,11 @@ export class Terminal {
       this.keyEncPtr, this.tPtr,
     );
 
-    // Resize to initial dimensions
-    this.wasm.ghostty_terminal_resize(this.tPtr, this.rows, this.cols);
+    // Install write buffer callback for DSR/DA responses
+    this.wasm.ghostty_wasm_terminal_set_write_buf(this.tPtr);
 
     this.initialized = true;
+    console.log("[terminal] initialized tPtr:", this.tPtr);
   }
 
   // ── Helpers ────────────────────────────────────────────────────
@@ -218,9 +253,15 @@ export class Terminal {
       : data;
 
     if (this.loaded && this.wasm && this.initialized) {
-      const { ptr, len } = this.allocBinary(buf);
-      this.wasm.ghostty_terminal_vt_write(this.tPtr, ptr, len);
+      // Allocate buffer in WASM memory and copy data
+      const ptr = this.wasm.ghostty_wasm_alloc_u8_array(buf.length);
+      if (ptr <= 0) return; // allocation failed
+      new Uint8Array(this.mem!.buffer, ptr, buf.length).set(buf);
+      this.wasm.ghostty_terminal_vt_write(this.tPtr, ptr, buf.length);
       this.wasm.ghostty_wasm_free_u8_array(ptr);
+
+      // Check for pending write data (DSR, DA, etc.)
+      this.flushWriteBuf();
     } else {
       // Fallback text buffer
       this.textBuffer += new TextDecoder().decode(buf);
@@ -228,6 +269,21 @@ export class Terminal {
       if (lines.length > this.rows * 2) {
         this.textBuffer = lines.slice(-this.rows).join("\n");
       }
+    }
+  }
+
+  /** Flush any pending terminal→PTY output to the write callback */
+  private flushWriteBuf(): void {
+    if (!this.wasm || !this.mem || !this.writeCb) return;
+    // write_buf_len is exported as the ADDRESS of the usize, read actual value
+    const lenAddr = this.wasm.ghostty_wasm_write_buf_len.value;
+    const len = new Uint32Array(this.mem.buffer, lenAddr, 1)[0];
+    if (len > 0 && len <= 4096) {
+      // write_buf is exported as the ADDRESS of the buffer
+      const bufAddr = this.wasm.ghostty_wasm_write_buf.value;
+      const data = new Uint8Array(this.mem.buffer, bufAddr, len).slice();
+      new Uint32Array(this.mem.buffer, lenAddr, 1)[0] = 0;
+      this.writeCb(data);
     }
   }
 

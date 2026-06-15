@@ -19,6 +19,39 @@ const builtin = @import("builtin");
 // or are too Ghostty-internal.
 const terminal = @import("terminal/main.zig");
 
+/// WASM-only: buffer for terminal→PTY output (DSR, DA responses, etc.)
+var wasm_write_buf align(1) = [_]u8{0} ** 4096;
+var wasm_write_buf_len: usize align(@alignOf(usize)) = 0;
+
+/// WASM write_pty callback: stores terminal output in the buffer above.
+/// JS code should call ghostty_terminal_set(t, 1, ghostty_wasm_write_cb)
+/// to install this, then poll ghostty_wasm_write_buf_len after each vt_write.
+fn wasmWritePtyCb(
+    _: *anyopaque,
+    _: ?*anyopaque,
+    data_ptr: [*]const u8,
+    len: usize,
+) callconv(.c) void {
+    const n = @min(len, wasm_write_buf.len);
+    @memcpy(wasm_write_buf[0..n], data_ptr[0..n]);
+    @atomicStore(usize, &wasm_write_buf_len, n, .seq_cst);
+}
+
+/// WASM convenience: create a terminal with default options.
+/// Returns the terminal pointer directly (no output parameter).
+/// JS: const t = ghostty_wasm_terminal_new_default();
+fn wasmTerminalNewDefault() callconv(.c) ?*anyopaque {
+    const c = terminal.c_api;
+    var result: c.terminal.Terminal = null;
+    const opts: c.terminal.Options = .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback = 1000,
+    };
+    _ = c.terminal_new(null, &result, opts);
+    return @ptrCast(result orelse return null);
+}
+
 /// System interface for the terminal package.
 ///
 /// This module provides runtime-swappable function pointers for operations
@@ -309,6 +342,22 @@ comptime {
             @export(&alloc.freeUsize, .{ .name = "ghostty_wasm_free_usize" });
             @export(&c.wasm_alloc_sgr_attribute, .{ .name = "ghostty_wasm_alloc_sgr_attribute" });
             @export(&c.wasm_free_sgr_attribute, .{ .name = "ghostty_wasm_free_sgr_attribute" });
+
+            // WASM write buffer: captures terminal→PTY output (DSR, DA, etc.)
+            // so JS can forward responses back to the WebSocket server.
+            @export(&wasm_write_buf, .{ .name = "ghostty_wasm_write_buf" });
+            @export(&wasm_write_buf_len, .{ .name = "ghostty_wasm_write_buf_len" });
+            @export(&wasmWritePtyCb, .{ .name = "ghostty_wasm_write_cb" });
+            @export(&wasmTerminalNewDefault, .{ .name = "ghostty_wasm_terminal_new_default" });
+
+            // Convenience: install the write callback on a terminal.
+            // JS: ghostty_wasm_terminal_set_write_buf(terminalPtr)
+            const setWriteBuf = struct {
+                fn f(t: *anyopaque) callconv(.c) void {
+                    _ = c.terminal_set(@ptrCast(@alignCast(t)), .write_pty, @ptrCast(@alignCast(&wasmWritePtyCb)));
+                }
+            }.f;
+            @export(&setWriteBuf, .{ .name = "ghostty_wasm_terminal_set_write_buf" });
         }
     }
 }
