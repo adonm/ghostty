@@ -1,348 +1,421 @@
 /**
- * terminal.ts — Ghostty VT terminal wrapper
+ * terminal.ts — Ghostty VT terminal wrapper (WASM)
  *
- * Manages the terminal emulator (ghostty-vt.wasm) and provides
- * an API to feed input, get render state, and query terminal state.
- *
- * Falls back to a raw text buffer when WASM is not loaded.
+ * Loads ghostty-vt.wasm and provides a simple API for:
+ *   - Creating terminals
+ *   - Writing VT data
+ *   - Getting screen content (via formatter)
+ *   - Encoding keyboard input
  */
 
-// Types exported by ghostty-vt WASM (C ABI)
-interface GhosttyWasm {
-  // Memory
+// ── C type constants (from ghostty/vt/types.h) ────────────────────
+const GHOSTTY_RESULT = { SUCCESS: 0, OUT_OF_MEMORY: 1, INVALID_VALUE: 2 };
+const GHOSTTY_ALLOCATOR = { SIZE: 24 }; // GhosttyAllocator struct size
+
+interface GhosttyVtExports {
+  memory: WebAssembly.Memory;
+
+  // Terminal
+  ghostty_terminal_new(alloc: number): number;
+  ghostty_terminal_free(t: number): void;
+  ghostty_terminal_vt_write(t: number, data: number, len: number): void;
+  ghostty_terminal_resize(t: number, rows: number, cols: number): void;
+
+  // Render state
+  ghostty_render_state_new(alloc: number, out: number): number;
+  ghostty_render_state_update(rs: number, t: number): number;
+  ghostty_render_state_free(rs: number): void;
+  ghostty_render_state_get(rs: number, kind: number, out: number): number;
+
+  // Formatter
+  ghostty_formatter_terminal_new(
+    alloc: number, t: number, out: number,
+  ): number;
+  ghostty_formatter_free(f: number): number;
+  ghostty_formatter_format_alloc(
+    f: number, style: number, out_ptr: number, out_len: number,
+  ): number;
+
+  // Render state rows
+  ghostty_render_state_row_iterator_new(alloc: number, out: number): number;
+  ghostty_render_state_row_iterator_free(it: number): void;
+  ghostty_render_state_row_set(rs: number, kind: number, val: number): number;
+  ghostty_render_state_row_get(it: number, out: number): number;
+
+  // Grid ref
+  ghostty_terminal_grid_ref(t: number, point: number, out: number): number;
+
+  // Allocator
   ghostty_alloc(size: number): number;
   ghostty_free(ptr: number): void;
   ghostty_wasm_alloc_u8_array(ptr: number, len: number): number;
   ghostty_wasm_free_u8_array(ptr: number): void;
-  // Terminal
-  ghostty_terminal_new(rows: number, cols: number): number;
-  ghostty_terminal_free(ptr: number): void;
-  ghostty_terminal_resize(ptr: number, rows: number, cols: number): void;
-  ghostty_terminal_vt_write(ptr: number, data: number, len: number): void;
-  // Render state
-  ghostty_render_state_new(terminal: number): number;
-  ghostty_render_state_update(rs: number, terminal: number): number;
-  ghostty_render_state_free(rs: number): void;
-  // Colors
-  ghostty_render_state_colors_get(
-    rs: number,
-    fg: number,
-    bg: number,
-    cursorFg: number,
-    cursorBg: number,
-    selFg: number,
-    selBg: number,
-  ): void;
-  // Cursor
-  ghostty_render_state_cursor_pos(rs: number, x: number, y: number): void;
-  ghostty_render_state_cursor_visual_style(rs: number): number;
-  // Viewport
-  ghostty_render_state_viewport_size(rs: number, rows: number, cols: number): void;
-  // Row iteration
-  ghostty_render_state_row_iterator_new(rs: number): number;
-  ghostty_render_state_row_iterator_next(it: number): number;
-  ghostty_render_state_row_iterator_free(it: number): void;
-  ghostty_render_state_row_get(it: number): number;
-  ghostty_render_state_row_cells_new(it: number): number;
-  ghostty_render_state_row_cells_next(cells: number): number;
-  ghostty_render_state_row_cells_free(cells: number): void;
-  // Cell data
-  ghostty_render_state_row_cells_get(
-    cells: number,
-    codepoint: number,
-    style: number,
-  ): void;
-  ghostty_render_state_row_cells_get_multi(
-    cells: number,
-    codepoints: number,
-    n: number,
-    style: number,
-    count: number,
-  ): void;
-  // Selection
-  ghostty_terminal_select_all(terminal: number): void;
-  ghostty_terminal_selection_format_alloc(
-    terminal: number,
-    output: number,
-    len: number,
-  ): number;
-  // Key encode
+
+  // Key
   ghostty_key_event_new(): number;
   ghostty_key_event_free(ev: number): void;
-  ghostty_key_event_set_utf8(ev: number, data: number, len: number): void;
+  ghostty_key_event_set_utf8(ev: number, ptr: number, len: number): void;
   ghostty_key_encoder_new(): number;
   ghostty_key_encoder_free(enc: number): void;
-  ghostty_key_encoder_setopt_from_terminal(
-    enc: number,
-    terminal: number,
-  ): void;
+  ghostty_key_encoder_setopt_from_terminal(enc: number, t: number): number;
   ghostty_key_encoder_encode(
-    enc: number,
-    ev: number,
-    output: number,
-    len: number,
+    enc: number, ev: number, out_ptr: number, out_len: number,
   ): number;
-  // Style
-  ghostty_style_default(): number;
-  ghostty_style_is_default(style: number): boolean;
-  // Memory access
-  memory: WebAssembly.Memory;
-}
 
-export interface CellStyle {
-  fg_r: number;
-  fg_g: number;
-  fg_b: number;
-  bg_r: number;
-  bg_g: number;
-  bg_b: number;
-  bold: boolean;
-  italic: boolean;
-  underline: boolean;
-  strikethrough: boolean;
-  inverse: boolean;
-  dim: boolean;
-  blink: boolean;
+  // Selection format
+  ghostty_terminal_selection_format_alloc(
+    t: number, style: number, out_ptr: number, out_len: number,
+  ): number;
+
+  // Mouse
+  ghostty_mouse_event_new(): number;
+  ghostty_mouse_event_free(ev: number): void;
+  ghostty_mouse_event_set_button(ev: number, btn: number): void;
+  ghostty_mouse_event_set_mods(ev: number, mods: number): void;
+  ghostty_mouse_event_set_position(ev: number, x: number, y: number): void;
+  ghostty_mouse_encoder_new(): number;
+  ghostty_mouse_encoder_free(enc: number): void;
+  ghostty_mouse_encoder_setopt_from_terminal(enc: number, t: number): number;
+  ghostty_mouse_encoder_encode(
+    enc: number, ev: number, out_ptr: number, out_len: number,
+  ): number;
 }
 
 export interface Cell {
-  codepoint: number; // Unicode codepoint
-  width: number; // 1 or 2 (wide chars)
-  style: CellStyle;
-  isWide: boolean;
+  codepoint: number;
+  width: number;
+  fg: [number, number, number];
+  bg: [number, number, number];
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  inverse: boolean;
 }
 
 export interface RenderRow {
-  y: number; // Row index in viewport
+  y: number;
+  text: string; // For now: plain text per row
   cells: Cell[];
 }
 
 export interface CursorState {
   x: number;
   y: number;
-  style: "bar" | "block" | "underline" | "hollow_block";
   visible: boolean;
 }
 
 export interface TerminalColors {
-  foreground: [number, number, number, number]; // RGBA
+  foreground: [number, number, number, number];
   background: [number, number, number, number];
-  cursor: [number, number, number, number];
-  cursorText: [number, number, number, number];
-  selectionFg: [number, number, number, number];
-  selectionBg: [number, number, number, number];
 }
 
 export class Terminal {
-  private wasm: GhosttyWasm | null = null;
-  private terminalPtr = 0;
-  private renderStatePtr = 0;
-  private encoderPtr = 0;
-  private keyEncoderPtr = 0;
+  private wasm: GhosttyVtExports | null = null;
+  private mem: DataView | null = null;
+  private tPtr = 0;
+  private rsPtr = 0;
+  private fmtPtr = 0;
+  private keyEncPtr = 0;
+  private keyEvPtr = 0;
   private rows = 24;
   private cols = 80;
-  private fallbackBuffer = "";
   private loaded = false;
+  private textBuffer = "";
+  private initialized = false;
 
-  // ── WASM loading ──────────────────────────────────────────────
   async load(wasmUrl?: string): Promise<void> {
     const url = wasmUrl ?? "/ghostty-vt.wasm";
     try {
       const response = await fetch(url);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const bytes = await response.arrayBuffer();
-      const mod = await WebAssembly.instantiate(bytes, {
-        env: {
-          memory: new WebAssembly.Memory({ initial: 256 }),
-          // Required WASM imports
-          abort: () => { /* noop */ },
+      const env = {
+        memory: new WebAssembly.Memory({ initial: 256, maximum: 1024 }),
+        // WASI stubs (ghostty-vt doesn't use WASI but the toolchain may emit imports)
+        "wasi_snapshot_preview1": {
+          fd_write: () => { /* noop */ },
+          fd_close: () => { /* noop */ },
+          fd_seek: () => { /* noop */ },
+          proc_exit: () => { /* noop */ },
+          environ_sizes_get: () => 0,
+          environ_get: () => 0,
         },
-      });
-      this.wasm = mod.instance.exports as unknown as GhosttyWasm;
-      this.initFromWasm();
+      };
+      const mod = await WebAssembly.instantiate(bytes, { env });
+      this.wasm = mod.instance.exports as unknown as GhosttyVtExports;
+      this.mem = new DataView(this.wasm.memory.buffer);
       this.loaded = true;
-      console.log("[terminal] ghostty-vt.wasm loaded");
+      console.log("[terminal] ghostty-vt.wasm loaded successfully");
+      this.init();
     } catch (err) {
-      console.warn("[terminal] WASM load failed, using fallback:", err);
+      console.warn("[terminal] WASM load failed, using text fallback:", err);
       this.loaded = false;
     }
   }
 
-  private initFromWasm(): void {
-    if (!this.wasm) return;
-    this.terminalPtr = this.wasm.ghostty_terminal_new(this.rows, this.cols);
-    this.renderStatePtr = this.wasm.ghostty_render_state_new(this.terminalPtr);
-    this.encoderPtr = this.wasm.ghostty_key_event_new();
-    this.keyEncoderPtr = this.wasm.ghostty_key_encoder_new();
+  private init(): void {
+    if (!this.loaded || !this.wasm) return;
+
+    // Create terminal
+    this.tPtr = this.wasm.ghostty_terminal_new(0); // NULL allocator = default
+    if (!this.tPtr) {
+      console.error("[terminal] failed to create terminal");
+      this.loaded = false;
+      return;
+    }
+
+    // Create render state
+    const rsBuf = new Uint32Array(1);
+    this.wasm.ghostty_render_state_new(0, this.ptrOf(rsBuf));
+    this.rsPtr = rsBuf[0];
+    if (!this.rsPtr) {
+      console.warn("[terminal] render state creation failed");
+    }
+
+    // Create formatter
+    const fmtBuf = new Uint32Array(1);
+    this.wasm.ghostty_formatter_terminal_new(0, this.tPtr, this.ptrOf(fmtBuf));
+    this.fmtPtr = fmtBuf[0];
+
+    // Create key encoder + event
+    this.keyEvPtr = this.wasm.ghostty_key_event_new();
+    this.keyEncPtr = this.wasm.ghostty_key_encoder_new();
     this.wasm.ghostty_key_encoder_setopt_from_terminal(
-      this.keyEncoderPtr,
-      this.terminalPtr,
+      this.keyEncPtr, this.tPtr,
     );
+
+    // Resize to initial dimensions
+    this.wasm.ghostty_terminal_resize(this.tPtr, this.rows, this.cols);
+
+    this.initialized = true;
   }
 
-  // ── Feed data ──────────────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────
+  private ptrOf(arr: Uint8Array | Uint32Array): number {
+    return arr.byteOffset;
+  }
+
+  private readString(ptr: number, len: number): string {
+    if (!this.mem || len <= 0) return "";
+    const bytes = new Uint8Array(this.mem.buffer, ptr, len);
+    return new TextDecoder().decode(bytes);
+  }
+
+  private allocStr(s: string): { ptr: number; len: number } {
+    if (!this.wasm) return { ptr: 0, len: 0 };
+    const enc = new TextEncoder();
+    const buf = enc.encode(s);
+    const ptr = this.wasm.ghostty_wasm_alloc_u8_array(
+      this.ptrOf(buf), buf.length,
+    );
+    return { ptr, len: buf.length };
+  }
+
+  // ── Public API ─────────────────────────────────────────────────
   write(data: Uint8Array | string): void {
     const buf = typeof data === "string"
       ? new TextEncoder().encode(data)
       : data;
-    if (this.loaded && this.wasm) {
-      const ptr = this.wasm.ghostty_wasm_alloc_u8_array(
-        buf.byteOffset,
-        buf.length,
-      );
-      this.wasm.ghostty_terminal_vt_write(this.terminalPtr, ptr, buf.length);
+
+    if (this.loaded && this.wasm && this.initialized) {
+      const { ptr, len } = this.allocBinary(buf);
+      this.wasm.ghostty_terminal_vt_write(this.tPtr, ptr, len);
       this.wasm.ghostty_wasm_free_u8_array(ptr);
     } else {
-      // Fallback: accumulate raw text
-      const text = new TextDecoder().decode(buf);
-      this.fallbackBuffer += text;
-      // Keep buffer reasonable
-      if (this.fallbackBuffer.length > 100_000) {
-        this.fallbackBuffer = this.fallbackBuffer.slice(-50_000);
+      // Fallback text buffer
+      this.textBuffer += new TextDecoder().decode(buf);
+      const lines = this.textBuffer.split("\n");
+      if (lines.length > this.rows * 2) {
+        this.textBuffer = lines.slice(-this.rows).join("\n");
       }
     }
+  }
+
+  private allocBinary(buf: Uint8Array): { ptr: number; len: number } {
+    if (!this.wasm) return { ptr: 0, len: 0 };
+    const ptr = this.wasm.ghostty_wasm_alloc_u8_array(
+      this.ptrOf(buf), buf.length,
+    );
+    return { ptr, len: buf.length };
   }
 
   resize(rows: number, cols: number): void {
     this.rows = rows;
     this.cols = cols;
-    if (this.loaded && this.wasm) {
-      this.wasm.ghostty_terminal_resize(this.terminalPtr, rows, cols);
+    if (this.loaded && this.wasm && this.initialized) {
+      this.wasm.ghostty_terminal_resize(this.tPtr, rows, cols);
     }
   }
 
-  // ── Render state ────────────────────────────────────────────────
   getRenderRows(): RenderRow[] {
-    if (!this.loaded || !this.wasm) {
-      return this.fallbackRenderRows();
+    if (!this.loaded || !this.wasm || !this.initialized) {
+      return this.fallbackRows();
     }
+    return this.wasmRows();
+  }
 
-    this.wasm.ghostty_render_state_update(
-      this.renderStatePtr,
-      this.terminalPtr,
-    );
+  // ── WASM render ────────────────────────────────────────────────
+  private wasmRows(): RenderRow[] {
+    if (!this.wasm || !this.mem) return this.fallbackRows();
+
+    // Method 1: format screen as plain text
+    // const text = this.formatScreen();
+    // return textToRenderRows(text, this.rows, this.cols);
+
+    // Method 2: render state iteration (simpler row counts)
     const rows: RenderRow[] = [];
-    const it = this.wasm.ghostty_render_state_row_iterator_new(
-      this.renderStatePtr,
-    );
 
-    let rowPtr: number;
-    while ((rowPtr = this.wasm.ghostty_render_state_row_iterator_next(it)) !== 0) {
-      const y = this.wasm.ghostty_render_state_row_get(rowPtr);
-      const cells: Cell[] = [];
-      const cellsIt = this.wasm.ghostty_render_state_row_cells_new(rowPtr);
-      let cellOk: number;
-      while ((cellOk = this.wasm.ghostty_render_state_row_cells_next(cellsIt)) !== 0) {
-        // Read cell codepoint and style together
-        const codepoint = new Uint32Array(this.wasm.memory.buffer, 0, 1);
-        const stylePtr = this.wasm.ghostty_style_default();
-        // FIXME: actual cell reading needs proper buffer setup
-        // For now, use simple codepoint access
-        cells.push({
-          codepoint: 0x20, // space
-          width: 1,
-          style: this.defaultStyle(),
-          isWide: false,
-        });
+    // Get screen size from render state
+    // For now, read the screen by iterating rows via grid_ref
+    // This is simplified: just get the formatted text per row
+
+    // Use render state to get screen content
+    if (this.rsPtr) {
+      this.wasm.ghostty_render_state_update(this.rsPtr, this.tPtr);
+
+      // Create row iterator
+      const itBuf = new Uint32Array(1);
+      const result = this.wasm.ghostty_render_state_row_iterator_new(
+        0, this.ptrOf(itBuf),
+      );
+      if (result !== 0) {
+        return this.fallbackRows();
       }
-      this.wasm.ghostty_render_state_row_cells_free(cellsIt);
-      rows.push({ y, cells });
+
+      const it = itBuf[0];
+      const rowOut = new Int32Array(1);
+
+      for (let i = 0; i < this.rows; i++) {
+        const rowRes = this.wasm.ghostty_render_state_row_get(
+          it, this.ptrOf(rowOut),
+        );
+        if (rowRes !== 0 || rowOut[0] < 0) break;
+
+        const y = rowOut[0];
+        // For now, just mark rows as existing. Cell iteration
+        // requires the cells_new/next/get API which is more complex.
+        rows.push({ y, text: "", cells: [] });
+      }
+
+      this.wasm.ghostty_render_state_row_iterator_free(it);
     }
-    this.wasm.ghostty_render_state_row_iterator_free(it);
+
+    // Fallback: format as plain text
+    if (rows.length === 0) {
+      return this.fallbackRows();
+    }
+
     return rows;
   }
 
+  // ── Format as plain text ───────────────────────────────────────
+  private formatScreen(): string {
+    if (!this.wasm || !this.fmtPtr) return this.textBuffer;
+
+    const outPtr = new Uint32Array(1);
+    const outLen = new Uint32Array(1);
+    const result = this.wasm.ghostty_formatter_format_alloc(
+      this.fmtPtr,
+      0, // PLAIN_TEXT = 0
+      this.ptrOf(outPtr),
+      this.ptrOf(outLen),
+    );
+    if (result !== 0) return this.textBuffer;
+
+    const text = this.readString(outPtr[0], Math.min(outLen[0], 100000));
+    this.wasm.ghostty_free(outPtr[0]);
+    return text;
+  }
+
   getCursor(): CursorState {
-    return { x: 0, y: 0, style: "block", visible: true };
+    return { x: 0, y: 0, visible: true };
   }
 
   getColors(): TerminalColors {
     return {
       foreground: [0xe0, 0xe0, 0xe0, 0xff],
       background: [0x1a, 0x1a, 0x2e, 0xff],
-      cursor: [0xff, 0xff, 0xff, 0xff],
-      cursorText: [0x00, 0x00, 0x00, 0xff],
-      selectionFg: [0xff, 0xff, 0xff, 0xff],
-      selectionBg: [0x40, 0x40, 0x80, 0xff],
     };
   }
 
   // ── Input encoding ──────────────────────────────────────────────
-  encodeKey(key: string, ctrl: boolean, alt: boolean, meta: boolean): Uint8Array | null {
+  encodeKey(
+    key: string,
+    ctrl: boolean,
+    alt: boolean,
+    meta: boolean,
+  ): Uint8Array | null {
     const text = key.length === 1 ? key : null;
-    // Simple encoding for common keys
-    if (text && !ctrl && !alt && !meta) {
-      return new TextEncoder().encode(text);
-    }
-    if (key === "Enter") return new TextEncoder().encode("\r");
-    if (key === "Backspace") return new TextEncoder().encode("\x7f");
-    if (key === "Tab") return new TextEncoder().encode("\t");
-    if (key === "Escape") return new TextEncoder().encode("\x1b");
-    if (key === "ArrowUp") return new TextEncoder().encode("\x1b[A");
-    if (key === "ArrowDown") return new TextEncoder().encode("\x1b[B");
-    if (key === "ArrowRight") return new TextEncoder().encode("\x1b[C");
-    if (key === "ArrowLeft") return new TextEncoder().encode("\x1b[D");
-    if (key === "Home") return new TextEncoder().encode("\x1b[H");
-    if (key === "End") return new TextEncoder().encode("\x1b[F");
-    if (key === "PageUp") return new TextEncoder().encode("\x1b[5~");
-    if (key === "PageDown") return new TextEncoder().encode("\x1b[6~");
-    if (key === "Delete") return new TextEncoder().encode("\x1b[3~");
-    if (key === "Insert") return new TextEncoder().encode("\x1b[2~");
+
+    // Simple common-case encoding
+    if (text && !ctrl && !alt && !meta) return new TextEncoder().encode(text);
+    if (key === "Enter") return new Uint8Array([13]); // \r
+    if (key === "Backspace") return new Uint8Array([127]); // \x7f
+    if (key === "Tab") return new Uint8Array([9]); // \t
+    if (key === "Escape") return new Uint8Array([27]); // \x1b
+
+    // Arrow keys (ANSI)
+    if (key === "ArrowUp") return new Uint8Array([27, 91, 65]); // ESC [ A
+    if (key === "ArrowDown") return new Uint8Array([27, 91, 66]); // ESC [ B
+    if (key === "ArrowRight") return new Uint8Array([27, 91, 67]); // ESC [ C
+    if (key === "ArrowLeft") return new Uint8Array([27, 91, 68]); // ESC [ D
+
+    // Nav keys
+    if (key === "Home") return new Uint8Array([27, 91, 72]); // ESC [ H
+    if (key === "End") return new Uint8Array([27, 91, 70]); // ESC [ F
+    if (key === "PageUp") return new Uint8Array([27, 91, 53, 126]); // ESC [ 5 ~
+    if (key === "PageDown") return new Uint8Array([27, 91, 54, 126]); // ESC [ 6 ~
+    if (key === "Delete") return new Uint8Array([27, 91, 51, 126]); // ESC [ 3 ~
+    if (key === "Insert") return new Uint8Array([27, 91, 50, 126]); // ESC [ 2 ~
+
     // Ctrl+letter
     if (ctrl && text && text.length === 1) {
       const c = text.charCodeAt(0);
       if (c >= 0x40 && c <= 0x5f) return new Uint8Array([c - 0x40]);
       if (c >= 0x61 && c <= 0x7a) return new Uint8Array([c - 0x60]);
     }
+
     return null;
   }
 
-  // ── Fallback rendering ──────────────────────────────────────────
-  private fallbackRenderRows(): RenderRow[] {
-    const lines = this.fallbackBuffer.split("\n").slice(-this.rows);
-    const result: RenderRow[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const text = lines[i].slice(0, this.cols);
-      const cells: Cell[] = [];
-      for (const ch of text) {
-        cells.push({
-          codepoint: ch.codePointAt(0) ?? 0x20,
-          width: 1,
-          style: this.defaultStyle(),
-          isWide: false,
-        });
-      }
-      // Pad to full width
-      while (cells.length < this.cols) {
-        cells.push({
-          codepoint: 0x20,
-          width: 1,
-          style: this.defaultStyle(),
-          isWide: false,
-        });
-      }
-      result.push({ y: i, cells });
-    }
-    return result;
+  // ── Fallback: plain text rows ───────────────────────────────────
+  private fallbackRows(): RenderRow[] {
+    return textToRenderRows(this.formatScreen() || this.textBuffer, this.rows, this.cols);
   }
 
-  private defaultStyle(): CellStyle {
-    return {
-      fg_r: 0xe0, fg_g: 0xe0, fg_b: 0xe0,
-      bg_r: 0x1a, bg_g: 0x1a, bg_b: 0x2e,
-      bold: false, italic: false, underline: false,
-      strikethrough: false, inverse: false, dim: false,
-      blink: false,
-    };
-  }
-
-  // ── Cleanup ─────────────────────────────────────────────────────
   destroy(): void {
-    if (this.wasm && this.terminalPtr) {
-      this.wasm.ghostty_render_state_free(this.renderStatePtr);
-      this.wasm.ghostty_terminal_free(this.terminalPtr);
-      this.wasm.ghostty_key_event_free(this.keyEncoderPtr);
-      this.wasm.ghostty_key_encoder_free(this.encoderPtr);
+    if (this.wasm) {
+      if (this.fmtPtr) this.wasm.ghostty_formatter_free(this.fmtPtr);
+      if (this.rsPtr) this.wasm.ghostty_render_state_free(this.rsPtr);
+      if (this.tPtr) this.wasm.ghostty_terminal_free(this.tPtr);
+      if (this.keyEvPtr) this.wasm.ghostty_key_event_free(this.keyEvPtr);
+      if (this.keyEncPtr) this.wasm.ghostty_key_encoder_free(this.keyEncPtr);
     }
   }
+}
+
+// ── Utility ───────────────────────────────────────────────────────
+function textToRenderRows(
+  text: string, maxRows: number, maxCols: number,
+): RenderRow[] {
+  const lines = text.split("\n").slice(-maxRows);
+  const rows: RenderRow[] = [];
+  for (let i = 0; i < Math.min(lines.length, maxRows); i++) {
+    const line = lines[i].slice(0, maxCols);
+    const cells: Cell[] = [];
+    for (const ch of line) {
+      cells.push({
+        codepoint: ch.codePointAt(0) ?? 0x20,
+        width: 1,
+        fg: [0xe0, 0xe0, 0xe0],
+        bg: [0x1a, 0x1a, 0x2e],
+        bold: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+      });
+    }
+    rows.push({ y: i, text: line, cells });
+  }
+  return rows;
 }

@@ -71,11 +71,17 @@ modules:
         --prefix /app
         --search-prefix /app
         --system $PWD/vendor/p
+      # Build the native PTY bridge for Deno
+      - zig build-exe -OReleaseSmall -lc
+        src/pty_bridge.zig
+        --name pty-bridge
+        -femit-bin=web/server/pty-bridge
       # Install WASM binary alongside web files
       - mkdir -p /app/share/ghostty/web
       - cp zig-out/bin/ghostty-vt.wasm /app/share/ghostty/web/
       - cp -r web/client/* /app/share/ghostty/web/
       - cp web/server/main.ts /app/share/ghostty/web/server.ts
+      - cp web/server/pty-bridge /app/share/ghostty/web/pty-bridge
       # Create the server wrapper script
       - |
         cat > /app/bin/ghostty-serve << 'WRAPPER'

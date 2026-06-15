@@ -1,13 +1,13 @@
 /**
  * app.ts — Ghostty Remote PWA main entrypoint
  *
- * Initializes the WebGPU renderer, WASM terminal, and WebSocket transport.
+ * Initializes renderer, WASM terminal, and WebSocket transport.
  * Handles keyboard/mouse input and the render loop.
  */
 
 import { Transport } from "./transport.js";
 import { Terminal } from "./terminal.js";
-import { WebGPURenderer } from "./renderer.js";
+import { TerminalRenderer } from "./renderer.js";
 
 // ── State ──────────────────────────────────────────────────────────
 const canvas = document.getElementById("terminal") as HTMLCanvasElement;
@@ -16,8 +16,8 @@ const statusText = document.getElementById("status-text")!;
 
 const transport = new Transport();
 const terminal = new Terminal();
-const renderer = new WebGPURenderer(canvas, {
-  fontWidth: 8,
+const renderer = new TerminalRenderer(canvas, {
+  fontWidth: 8.4,
   fontHeight: 16,
 });
 
@@ -27,27 +27,25 @@ let rafId = 0;
 // ── Initialization ─────────────────────────────────────────────────
 async function init() {
   statusText.textContent = "Initializing WebGPU...";
-
-  const gpuOk = await renderer.init();
-  if (!gpuOk) {
-    statusText.textContent = "WebGPU not supported. Use Chrome 113+ or Edge 113+.";
-    return;
-  }
+  await renderer.init();
 
   statusText.textContent = "Loading terminal emulator...";
   try {
     await terminal.load("/ghostty-vt.wasm");
-  } catch {
-    // Continue with fallback mode
+  } catch (err) {
+    console.warn("[app] WASM load error:", err);
   }
 
   updateGrid();
   statusText.textContent = "Connecting...";
   setupTransport();
   transport.connect();
+
+  setupInput();
+  startRenderLoop();
 }
 
-// ── Transport setup ────────────────────────────────────────────────
+// ── Transport ──────────────────────────────────────────────────────
 function setupTransport() {
   transport.onEvent((e) => {
     switch (e.type) {
@@ -61,7 +59,7 @@ function setupTransport() {
       case "disconnected":
         connected = false;
         connectingEl.classList.remove("hidden");
-        statusText.textContent = "Reconnecting...";
+        statusText.textContent = "Disconnected. Reconnecting...";
         break;
       case "error":
         statusText.textContent = `Error: ${e.message}`;
@@ -70,89 +68,83 @@ function setupTransport() {
   });
 }
 
-// ── Grid management ────────────────────────────────────────────────
+// ── Grid ───────────────────────────────────────────────────────────
 function updateGrid() {
-  const { rows, cols } = renderer.getGridFromCanvas();
-  terminal.resize(rows, cols);
-  renderer.setGrid(rows, cols);
+  const { rows, cols } = renderer.getGrid();
+  if (rows > 0 && cols > 0) {
+    terminal.resize(rows, cols);
+    renderer.setGrid(rows, cols);
+  }
 }
 
-// ── Input handling ─────────────────────────────────────────────────
+// ── Input ──────────────────────────────────────────────────────────
 function setupInput() {
-  // Keyboard
   document.addEventListener("keydown", (e) => {
-    if (e.metaKey || e.altKey) return; // Browser shortcuts
+    // Allow browser shortcuts with Meta/Ctrl+Shift
+    if (e.metaKey || (e.ctrlKey && e.shiftKey)) return;
     e.preventDefault();
 
-    const encoded = terminal.encodeKey(
-      e.key,
-      e.ctrlKey,
-      false,
-      false,
-    );
-    if (encoded) {
-      transport.send(encoded);
-    }
+    const encoded = terminal.encodeKey(e.key, e.ctrlKey, e.altKey, e.metaKey);
+    if (encoded) transport.send(encoded);
   });
 
-  // Handle composition (IME) - send composed text
-  canvas.addEventListener("compositionend", (e) => {
-    const text = e.data;
+  // IME composition
+  const inputEl = document.createElement("input");
+  inputEl.style.cssText =
+    "position:fixed;top:-100px;left:0;width:1px;height:1px;opacity:0;";
+  document.body.appendChild(inputEl);
+
+  inputEl.addEventListener("compositionend", () => {
+    const text = inputEl.value;
+    if (text) transport.send(text);
+    inputEl.value = "";
+  });
+
+  canvas.addEventListener("click", () => inputEl.focus());
+
+  // Paste
+  document.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text/plain");
     if (text) transport.send(text);
   });
 
-  // Touch/mouse for mobile
-  canvas.addEventListener("click", () => {
-    // Focus for keyboard
-    canvas.focus();
-  });
-
-  // Handle paste
-  document.addEventListener("paste", (e) => {
-    const text = e.clipboardData?.getData("text/plain");
-    if (text) {
-      transport.send(text);
-    }
-  });
-
   // Resize
+  let resizeTimer: ReturnType<typeof setTimeout>;
   window.addEventListener("resize", () => {
-    updateGrid();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      renderer.resize();
+      updateGrid();
+    }, 100);
   });
 
-  // Prevent zooming on mobile
+  // Prevent zoom
   document.addEventListener("gesturestart", (e) => e.preventDefault());
-  document.addEventListener("gesturechange", (e) => e.preventDefault());
-  document.addEventListener("gestureend", (e) => e.preventDefault());
 }
 
 // ── Render loop ────────────────────────────────────────────────────
-function renderLoop() {
-  rafId = requestAnimationFrame(renderLoop);
+function startRenderLoop() {
+  function frame() {
+    rafId = requestAnimationFrame(frame);
 
-  if (!connected && !terminal) return;
-
-  try {
-    const renderRows = terminal.getRenderRows();
+    // Throttle to ~30fps when idle
+    const rows = terminal.getRenderRows();
     const cursor = terminal.getCursor();
     const colors = terminal.getColors();
-    renderer.render(renderRows, cursor, colors);
-  } catch (err) {
-    console.error("[app] render error:", err);
+
+    renderer.scheduleDraw(rows, cursor, colors);
+    renderer.drawFrame();
   }
+
+  rafId = requestAnimationFrame(frame);
 }
 
-// ── Service worker registration ────────────────────────────────────
-function registerSW() {
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/sw.js").catch((err) => {
-      console.warn("[app] ServiceWorker registration failed:", err);
-    });
-  }
+// ── PWA ────────────────────────────────────────────────────────────
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch((err) => {
+    console.warn("[app] SW registration failed:", err);
+  });
 }
 
-// ── Start ──────────────────────────────────────────────────────────
-registerSW();
-setupInput();
+// ── Go ─────────────────────────────────────────────────────────────
 init();
-renderLoop();

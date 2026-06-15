@@ -81,14 +81,58 @@ function serveStatic(reqPath: string): Response | null {
 
 // ── PTY bridge ─────────────────────────────────────────────────────
 /**
- * Spawn a shell with a PTY using `script`.
- * This creates a true PTY so programs like vim work.
+ * Spawn a shell with a real PTY using our Zig bridge.
+ * Built via: zig build-exe -OReleaseSmall -lc src/pty_bridge.zig
  */
 function spawnPty(
   shellCmd: string,
+): { process: Deno.ChildProcess; writer: WritableStreamDefaultWriter<Uint8Array>; } | null {
+  // Resolve bridge path: beside the server in flatpak, or relative for dev
+  const bridgePaths = [
+    "/app/share/ghostty/web/pty-bridge",
+    new URL("./pty-bridge", import.meta.url).pathname,
+  ];
+
+  let bridgeBin: string | null = null;
+  for (const p of bridgePaths) {
+    try {
+      const stat = Deno.statSync(p);
+      if (stat.isFile) { bridgeBin = p; break; }
+    } catch { /* try next */ }
+  }
+
+  if (!bridgeBin) {
+    // Fall back to `script` if available
+    console.warn("[pty] pty-bridge not found, falling back to script");
+    return spawnPtyScript(shellCmd);
+  }
+
+  const cmd = new Deno.Command(bridgeBin, {
+    args: [shellCmd],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+    env: {
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor",
+      LANG: Deno.env.get("LANG") ?? "en_US.UTF-8",
+      HOME: Deno.env.get("HOME") ?? "/",
+      USER: Deno.env.get("USER") ?? "ghostty",
+      PATH: Deno.env.get("PATH") ?? "/usr/bin",
+      SHELL: shellCmd,
+    },
+  });
+  const proc = cmd.spawn();
+  const writer = proc.stdin.getWriter();
+  return { process: proc, writer };
+}
+
+/**
+ * Fallback PTY using `script -qfc`.
+ */
+function spawnPtyScript(
+  shellCmd: string,
 ): { process: Deno.ChildProcess; writer: WritableStreamDefaultWriter<Uint8Array>; } {
-  // Use `script` to create a PTY. The -q flag makes it quiet, -f flushes.
-  // stdin/stdout of the script process are the PTY I/O.
   const cmd = new Deno.Command("script", {
     args: ["-qfc", shellCmd, "/dev/null"],
     stdin: "piped",
@@ -113,7 +157,13 @@ function spawnPty(
 function handleWs(sock: WebSocket) {
   console.log(`[ws] new terminal session`);
 
-  const { process, writer } = spawnPty(shell);
+  const ptyResult = spawnPty(shell);
+  if (!ptyResult) {
+    console.error("[ws] failed to spawn PTY");
+    sock.close(1011, "PTY spawn failed");
+    return;
+  }
+  const { process, writer } = ptyResult;
   let open = true;
 
   // PTY stdout → WebSocket

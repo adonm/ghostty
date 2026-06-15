@@ -4,7 +4,8 @@
   "exports": {},
   "tasks": {
     "serve": "deno run --allow-net --allow-read --allow-run --allow-write --allow-env server/main.ts",
-    "bundle": "deno run --allow-read --allow-write --allow-env server/bundle.ts"
+    "bundle": "deno run --allow-read --allow-write --allow-env server/bundle.ts",
+    "build-bridge": "zig build-exe -OReleaseSmall -lc ../src/pty_bridge.zig --name pty-bridge -femit-bin=server/pty-bridge"
   },
   "imports": {
     "@std/http": "jsr:@std/http@^1.0.0",

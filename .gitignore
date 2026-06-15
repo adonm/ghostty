@@ -23,6 +23,7 @@ flatpak/builddir/
 flatpak/repo/
 
 web/client/ghostty-vt.wasm
+web/server/pty-bridge
 glad.zip
 /Box_test.ppm
 /Box_test_diff.ppm

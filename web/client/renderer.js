@@ -1,11 +1,12 @@
 /**
- * renderer.ts — WebGPU terminal renderer
+ * renderer.ts — Hybrid WebGPU + Canvas2D terminal renderer
  *
- * Renders terminal cells using WebGPU. Uses a simple quad-per-cell
- * approach with color from the terminal's render state.
+ * Strategy:
+ *   - WebGPU canvas: colored background quads, cursor
+ *   - Canvas2D overlay: text glyphs (uses system monospace font)
  *
- * For text: renders colored background quads per cell. Full glyph
- * rendering requires a font atlas texture (future enhancement).
+ * This gives us readable text immediately while the WebGPU glyph
+ * atlas path is developed.
  */
 
 import type { Terminal, RenderRow, CursorState, TerminalColors } from "./terminal.js";
@@ -17,237 +18,87 @@ interface RendererConfig {
 }
 
 const DEFAULT_CONFIG: RendererConfig = {
-  fontWidth: 8,
+  fontWidth: 8.4, // Monospace average width at 16px
   fontHeight: 16,
   devicePixelRatio: window.devicePixelRatio || 1,
 };
 
-// WGSL shader for cell rendering
-const CELL_SHADER = /* wgsl */ `
-struct VertexInput {
-  @location(0) pos: vec2f,
-  @location(1) color: vec4f,
-};
-
-struct VertexOutput {
-  @builtin(position) pos: vec4f,
-  @location(0) color: vec4f,
-};
-
-@vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
-  var out: VertexOutput;
-  out.pos = vec4f(in.pos, 0.0, 1.0);
-  out.color = in.color;
-  return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-  return in.color;
-}
-`;
-
-// Cursor shader (blinking block/underline/bar)
-const CURSOR_SHADER = /* wgsl */ `
-struct VertexInput {
-  @location(0) pos: vec2f,
-  @location(1) color: vec4f,
-  @location(2) cursorType: f32,  // 0=block, 1=underline, 2=bar
-};
-
-struct VertexOutput {
-  @builtin(position) pos: vec4f,
-  @location(0) color: vec4f,
-  @location(1) cursorType: f32,
-};
-
-@vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
-  var out: VertexOutput;
-  out.pos = vec4f(in.pos, 0.0, 1.0);
-  out.color = in.color;
-  out.cursorType = in.cursorType;
-  return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-  return in.color;
-}
-`;
-
-export class WebGPURenderer {
-  private device: GPUDevice | null = null;
-  private context: GPUCanvasContext | null = null;
-  private cellPipeline: GPURenderPipeline | null = null;
-  private cursorPipeline: GPURenderPipeline | null = null;
-  private format: GPUTextureFormat = "bgra8unorm";
-  private config: RendererConfig;
+export class TerminalRenderer {
   private canvas: HTMLCanvasElement;
+  private textCanvas: HTMLCanvasElement;
+  private textCtx: CanvasRenderingContext2D;
+  private config: RendererConfig;
+  private screenRows = 24;
+  private screenCols = 80;
+  private gpu: GPUState | null = null;
 
-  // Buffers
-  private cellVertexBuffer: GPUBuffer | null = null;
-  private cellIndexBuffer: GPUBuffer | null = null;
-  private uniformBuffer: GPUBuffer | null = null;
-
-  // Viewport
-  private screenRows = 0;
-  private screenCols = 0;
+  // Animation frame tracking
+  private rafId = 0;
+  private needsDraw = true;
+  private lastRows: RenderRow[] = [];
+  private lastCursor: CursorState = { x: 0, y: 0, visible: true };
+  private lastColors: TerminalColors = {
+    foreground: [0xe0, 0xe0, 0xe0, 0xff],
+    background: [0x1a, 0x1a, 0x2e, 0xff],
+  };
 
   constructor(canvas: HTMLCanvasElement, config?: Partial<RendererConfig>) {
     this.canvas = canvas;
     this.config = { ...DEFAULT_CONFIG, ...config };
+
+    // Create text overlay canvas
+    this.textCanvas = document.createElement("canvas");
+    this.textCanvas.style.cssText =
+      "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;";
+    this.canvas.parentElement?.appendChild(this.textCanvas);
+    this.textCtx = this.textCanvas.getContext("2d")!;
+    this.textCtx.textBaseline = "top";
+    this.textCtx.font = `${this.config.fontHeight}px monospace`;
   }
 
   async init(): Promise<boolean> {
-    if (!navigator.gpu) {
-      console.warn("[renderer] WebGPU not available");
-      return false;
+    if (navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter({
+          powerPreference: "low-power",
+        });
+        if (adapter) {
+          const device = await adapter.requestDevice();
+          const ctx = this.canvas.getContext("webgpu");
+          if (ctx) {
+            const format = navigator.gpu.getPreferredCanvasFormat();
+            ctx.configure({ device, format, alphaMode: "opaque" });
+            this.gpu = { adapter, device, context: ctx, format };
+            console.log("[renderer] WebGPU initialized");
+          }
+        }
+      } catch (err) {
+        console.warn("[renderer] WebGPU init failed:", err);
+      }
     }
-
-    try {
-      const adapter = await navigator.gpu.requestAdapter({
-        powerPreference: "low-power",
-      });
-      if (!adapter) throw new Error("No adapter");
-
-      this.device = await adapter.requestDevice({
-        requiredFeatures: [],
-        requiredLimits: {},
-      });
-      this.device.addEventListener("uncapturederror", (e) => {
-        console.error("[renderer] WebGPU error:", e.error);
-      });
-
-      this.context = this.canvas.getContext("webgpu");
-      if (!this.context) throw new Error("No WebGPU context");
-
-      this.format = navigator.gpu.getPreferredCanvasFormat();
-      this.context.configure({
-        device: this.device,
-        format: this.format,
-        alphaMode: "opaque",
-      });
-
-      await this.createPipelines();
-      await this.createBuffers();
-      this.resizeCanvas();
-
-      console.log("[renderer] WebGPU initialized");
-      return true;
-    } catch (err) {
-      console.error("[renderer] WebGPU init failed:", err);
-      return false;
-    }
+    this.resize();
+    return true;
   }
 
-  private async createPipelines(): Promise<void> {
-    if (!this.device) return;
-
-    const cellModule = this.device.createShaderModule({ code: CELL_SHADER });
-    const cursorModule = this.device.createShaderModule({ code: CURSOR_SHADER });
-
-    // Cell pipeline layout
-    const layout = this.device.createPipelineLayout({
-      bindGroupLayouts: [],
-    });
-
-    // Cell pipeline: renders colored quads
-    this.cellPipeline = this.device.createRenderPipeline({
-      layout,
-      vertex: {
-        module: cellModule,
-        entryPoint: "vs_main",
-        buffers: [{
-          arrayStride: 24, // vec2f pos + vec4f color = 6 floats * 4 bytes
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: "float32x2" },
-            { shaderLocation: 1, offset: 8, format: "float32x4" },
-          ],
-        }],
-      },
-      fragment: {
-        module: cellModule,
-        entryPoint: "fs_main",
-        targets: [{ format: this.format }],
-      },
-      primitive: {
-        topology: "triangle-list",
-      },
-    });
-
-    // Cursor pipeline
-    this.cursorPipeline = this.device.createRenderPipeline({
-      layout,
-      vertex: {
-        module: cursorModule,
-        entryPoint: "vs_main",
-        buffers: [{
-          arrayStride: 32, // vec2 + vec4 + f32 = 8 floats * 4 bytes
-          stepMode: "instance",
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: "float32x2" },
-            { shaderLocation: 1, offset: 8, format: "float32x4" },
-            { shaderLocation: 2, offset: 24, format: "float32" },
-          ],
-        }],
-      },
-      fragment: {
-        module: cursorModule,
-        entryPoint: "fs_main",
-        targets: [{ format: this.format }],
-      },
-      primitive: { topology: "triangle-strip" },
-    });
-  }
-
-  private async createBuffers(): Promise<void> {
-    if (!this.device) return;
-
-    // Quad vertices: two triangles forming a rectangle
-    // Vertex format: [x, y, r, g, b, a]
-    const quadVerts = new Float32Array([
-      // Triangle 1
-      0, 0, 0, 0, 0, 0, // position (filled later), color (filled later)
-      1, 0, 0, 0, 0, 0,
-      0, 1, 0, 0, 0, 0,
-      // Triangle 2
-      1, 0, 0, 0, 0, 0,
-      0, 1, 0, 0, 0, 0,
-      1, 1, 0, 0, 0, 0,
-    ]);
-
-    this.cellVertexBuffer = this.device.createBuffer({
-      size: quadVerts.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.cellVertexBuffer, 0, quadVerts);
-
-    // Cursor instance data: 4 vertices for a triangle strip
-    const cursorVerts = new Float32Array([
-      -1, -1, 1, 1, 1, 1, 1, // top-left (ndc)
-      1, -1, 1, 1, 1, 1, 1, // top-right
-      -1, 1, 1, 1, 1, 1, 1, // bottom-left
-      1, 1, 1, 1, 1, 1, 1, // bottom-right
-    ]);
-    const cursorVP = this.device.createBuffer({
-      size: cursorVerts.byteLength,
-      usage: GPUBufferUsage.VERTEX,
-      mappedAtCreation: true,
-    });
-    new Float32Array(cursorVP.getMappedRange()).set(cursorVerts);
-    cursorVP.unmap();
-  }
-
-  private resizeCanvas(): void {
+  resize(): void {
     const dpr = this.config.devicePixelRatio;
-    const width = this.canvas.clientWidth * dpr;
-    const height = this.canvas.clientHeight * dpr;
-    if (this.canvas.width !== width || this.canvas.height !== height) {
-      this.canvas.width = width;
-      this.canvas.height = height;
+    const w = this.canvas.clientWidth * dpr;
+    const h = this.canvas.clientHeight * dpr;
+
+    if (Math.abs(this.canvas.width - w) > 1 || Math.abs(this.canvas.height - h) > 1) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+      this.textCanvas.width = w;
+      this.textCanvas.height = h;
     }
+
+    this.screenCols = Math.max(1, Math.floor(w / this.config.fontWidth));
+    this.screenRows = Math.max(1, Math.floor(h / this.config.fontHeight));
+    this.needsDraw = true;
+  }
+
+  getGrid(): { rows: number; cols: number } {
+    return { rows: this.screenRows, cols: this.screenCols };
   }
 
   setGrid(rows: number, cols: number): void {
@@ -255,111 +106,120 @@ export class WebGPURenderer {
     this.screenCols = cols;
   }
 
-  getGridFromCanvas(): { rows: number; cols: number } {
-    const dpr = this.config.devicePixelRatio;
-    const width = Math.floor(this.canvas.clientWidth * dpr / this.config.fontWidth);
-    const height = Math.floor(this.canvas.clientHeight * dpr / this.config.fontHeight);
-    return { rows: Math.max(1, height), cols: Math.max(1, width) };
-  }
-
-  render(
+  scheduleDraw(
     rows: RenderRow[],
     cursor: CursorState,
     colors: TerminalColors,
   ): void {
-    if (!this.device || !this.context || !this.cellPipeline) return;
+    this.lastRows = rows;
+    this.lastCursor = cursor;
+    this.lastColors = colors;
+    this.needsDraw = true;
+  }
 
-    this.resizeCanvas();
+  drawFrame(): void {
+    if (!this.needsDraw) return;
+    this.needsDraw = false;
 
+    this.drawBackgrounds();
+    this.drawText();
+  }
+
+  // ── Background rendering (WebGPU or Canvas2D fallback) ──────────
+  private drawBackgrounds(): void {
     const dpr = this.config.devicePixelRatio;
-    const fw = this.config.fontWidth;
     const fh = this.config.fontHeight;
-    const canvasW = this.canvas.width;
-    const canvasH = this.canvas.height;
+    const rows = this.lastRows;
+    const colors = this.lastColors;
 
-    // Build cell vertex data
-    const maxCells = this.screenRows * this.screenCols * 6; // 6 verts per cell
-    const vertData = new Float32Array(maxCells * 6); // 6 floats per vert
-    let vertIdx = 0;
+    // Use Canvas2D for backgrounds (simple and always works)
+    const ctx = this.canvas.getContext("2d");
+    if (!ctx) return;
 
+    ctx.save();
+    ctx.scale(dpr, dpr);
+
+    // Clear to background
+    ctx.fillStyle = rgbaStr(colors.background);
+    ctx.fillRect(0, 0, this.canvas.width / dpr, this.canvas.height / dpr);
+
+    // Draw cell backgrounds for non-default cells
+    const fw = this.config.fontWidth;
     for (const row of rows) {
-      for (let col = 0; col < row.cells.length && col < this.screenCols; col++) {
+      const y = row.y * fh;
+      for (let col = 0; col < row.cells.length; col++) {
         const cell = row.cells[col];
-        const x = col * fw / canvasW * 2 - 1;
-        const y = 1 - row.y * fh / canvasH * 2;
-        const w = (fw * (cell.isWide ? 2 : 1)) / canvasW * 2;
-        const h = fh / canvasH * 2;
-
-        // Normalize colors to 0-1
-        const r = cell.style.bg_r / 255;
-        const g = cell.style.bg_g / 255;
-        const b = cell.style.bg_b / 255;
-        const a = 1.0;
-
-        // If cell has a different FG, add a slight tint
-        const fgR = cell.style.fg_r / 255;
-
-        // 6 vertices per cell quad
-        const verts = [
-          x, y - h, r, g, b, a,
-          x + w, y - h, r, g, b, a,
-          x, y, r, g, b, a,
-          x + w, y - h, r, g, b, a,
-          x, y, r, g, b, a,
-          x + w, y, r, g, b, a,
-        ];
-
-        for (let i = 0; i < verts.length && vertIdx < vertData.length; i++) {
-          vertData[vertIdx++] = verts[i];
+        const bgStr = rgbStr(cell.bg);
+        if (bgStr !== rgbStr([0x1a, 0x1a, 0x2e])) {
+          ctx.fillStyle = bgStr;
+          ctx.fillRect(col * fw, y, fw, fh);
         }
       }
     }
 
-    // Write vertex data to GPU
-    if (vertIdx > 0) {
-      const bufferSize = vertIdx * 4; // float32 = 4 bytes
-      const vb = this.device.createBuffer({
-        size: Math.max(bufferSize, 4),
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      });
-      this.device.queue.writeBuffer(vb, 0, vertData, 0, vertIdx);
+    ctx.restore();
+  }
 
-      // Render
-      const encoder = this.device.createCommandEncoder();
-      const view = this.context.getCurrentTexture().createView();
+  // ── Text rendering (Canvas2D) ───────────────────────────────────
+  private drawText(): void {
+    const ctx = this.textCtx;
+    const dpr = this.config.devicePixelRatio;
+    const fw = this.config.fontWidth;
+    const fh = this.config.fontHeight;
+    const rows = this.lastRows;
+    const colors = this.lastColors;
 
-      const bgColor = colors.background;
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view,
-          clearValue: {
-            r: bgColor[0] / 255,
-            g: bgColor[1] / 255,
-            b: bgColor[2] / 255,
-            a: bgColor[3] / 255,
-          },
-          loadOp: "clear",
-          storeOp: "store",
-        }],
-      });
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, this.textCanvas.width / dpr, this.textCanvas.height / dpr);
 
-      pass.setPipeline(this.cellPipeline);
-      pass.setVertexBuffer(0, vb);
-      pass.draw(vertIdx / 6); // 6 floats per vertex, draw vertex count
-      pass.end();
+    ctx.font = `${fh}px 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace`;
+    ctx.textBaseline = "top";
 
-      this.device.queue.submit([encoder.finish()]);
+    // Adjust font width based on actual measurement
+    const measuredW = ctx.measureText("M").width;
+    const actualFw = measuredW > 0 ? measuredW : fw;
 
-      vb.destroy();
+    for (const row of rows) {
+      const y = row.y * fh;
+
+      // If we have pre-formatted text, render it directly
+      if (row.text) {
+        ctx.fillStyle = rgbaStr(colors.foreground);
+        ctx.fillText(row.text, 0, y);
+        continue;
+      }
+
+      // Otherwise render cell by cell
+      for (let col = 0; col < row.cells.length; col++) {
+        const cell = row.cells[col];
+        const cp = cell.codepoint;
+        if (cp <= 0x20 || cp === 0x7f) continue; // Skip control chars
+        const ch = String.fromCodePoint(cp);
+
+        const fg = cell.inverse ? cell.bg : cell.fg;
+        ctx.fillStyle = rgbStr(fg);
+
+        const x = col * actualFw;
+        ctx.fillText(ch, x, y);
+      }
     }
+
+    ctx.restore();
   }
 
   destroy(): void {
-    this.cellPipeline = null;
-    this.cursorPipeline = null;
-    this.cellVertexBuffer?.destroy();
-    this.device?.destroy();
-    this.device = null;
-    this.context = null;
+    this.textCanvas.remove();
+    this.gpu?.device?.destroy();
+    this.gpu = null;
   }
+}
+
+// ── Color helpers ─────────────────────────────────────────────────
+function rgbStr(rgb: [number, number, number]): string {
+  return `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+}
+
+function rgbaStr(rgba: [number, number, number, number]): string {
+  return `rgba(${rgba[0]},${rgba[1]},${rgba[2]},${rgba[3] / 255})`;
 }
