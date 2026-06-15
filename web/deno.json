@@ -1,0 +1,17 @@
+{
+  "name": "@ghostty/webgpu-pwa",
+  "version": "0.1.0",
+  "exports": {},
+  "tasks": {
+    "serve": "deno run --allow-net --allow-read --allow-run --allow-write --allow-env server/main.ts",
+    "bundle": "deno run --allow-read --allow-write --allow-env server/bundle.ts"
+  },
+  "imports": {
+    "@std/http": "jsr:@std/http@^1.0.0",
+    "@std/fs": "jsr:@std/fs@^1.0.0",
+    "@std/path": "jsr:@std/path@^1.0.0"
+  },
+  "compilerOptions": {
+    "lib": ["dom", "dom.iterable", "deno.ns"]
+  }
+}

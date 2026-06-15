@@ -56,3 +56,44 @@ modules:
           - zig-out
 
       - zig-packages.json
+
+  - name: ghostty-web
+    buildsystem: simple
+    build-options:
+      append-path: /app/zig
+    build-commands:
+      # Build the WASM terminal emulator
+      - zig build
+        -Demit-lib-vt
+        -Dtarget=wasm32-freestanding
+        -Doptimize=ReleaseSmall
+        -fno-sys=oniguruma
+        --prefix /app
+        --search-prefix /app
+        --system $PWD/vendor/p
+      # Install WASM binary alongside web files
+      - mkdir -p /app/share/ghostty/web
+      - cp zig-out/bin/ghostty-vt.wasm /app/share/ghostty/web/
+      - cp -r web/client/* /app/share/ghostty/web/
+      - cp web/server/main.ts /app/share/ghostty/web/server.ts
+      # Create the server wrapper script
+      - |
+        cat > /app/bin/ghostty-serve << 'WRAPPER'
+        #!/bin/sh
+        exec deno run --allow-net --allow-read --allow-run --allow-env \
+          /app/share/ghostty/web/server.ts \
+          --port "${PORT:-9090}" \
+          --shell "${SHELL:-/bin/bash}"
+        WRAPPER
+      - chmod +x /app/bin/ghostty-serve
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - flatpak/.flatpak-builder
+          - flatpak/builddir
+          - flatpak/repo
+          - zig-cache
+          - zig-out
+
+      - zig-packages.json

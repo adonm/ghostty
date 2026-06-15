@@ -22,6 +22,7 @@ test/cases/**/*.actual.png
 flatpak/builddir/
 flatpak/repo/
 
+web/client/ghostty-vt.wasm
 glad.zip
 /Box_test.ppm
 /Box_test_diff.ppm

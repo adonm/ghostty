@@ -69,3 +69,19 @@ modules:
             .assets[] | select(.name=="pandoc-" + $version + "-linux-arm64.tar.gz")
             | .browser_download_url
           version-query: .tag_name
+
+  - name: deno
+    buildsystem: simple
+    cleanup:
+      - "*"
+    build-commands:
+      - install -Dm755 deno /app/bin/deno
+    sources:
+      - type: archive
+        sha256: 01afc25a4c1ce9e76e793cbc206c7be5e60e7050e02a1e5aaeb8ed8070a5ae74
+        url: https://github.com/denoland/deno/releases/download/v2.3.10/deno-x86_64-unknown-linux-gnu.zip
+        only-arches: [x86_64]
+      - type: archive
+        sha256: 5c8e3d23fcd82e2c457a7a91b64b1e03a14396c18da9380b9ac6e5a9c0e1b3f5
+        url: https://github.com/denoland/deno/releases/download/v2.3.10/deno-aarch64-unknown-linux-gnu.zip
+        only-arches: [aarch64]
