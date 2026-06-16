@@ -1,12 +1,12 @@
 /**
  * app.ts — Ghostty Remote PWA main entrypoint
  *
- * Initializes renderer, WASM terminal, and WebSocket transport.
- * Handles keyboard/mouse input and the render loop.
+ * Uses JS ANSI parser for terminal emulation, Canvas2D for rendering.
+ * WebSocket transport for PTY I/O.
  */
 
 import { Transport } from "./transport.js";
-import { Terminal } from "./terminal.js";
+import { AnsiParser } from "./ansi.js";
 import { TerminalRenderer } from "./renderer.js";
 
 // ── State ──────────────────────────────────────────────────────────
@@ -15,32 +15,22 @@ const connectingEl = document.getElementById("connecting")!;
 const statusText = document.getElementById("status-text")!;
 
 const transport = new Transport();
-const terminal = new Terminal();
 const renderer = new TerminalRenderer(canvas, {
   fontWidth: 8.4,
   fontHeight: 16,
 });
 
+let parser: AnsiParser;
 let connected = false;
 let rafId = 0;
 
 // ── Initialization ─────────────────────────────────────────────────
 async function init() {
-  statusText.textContent = "Initializing WebGPU...";
+  statusText.textContent = "Initializing renderer...";
   await renderer.init();
-
-  statusText.textContent = "Loading terminal emulator...";
-  try {
-    await terminal.load("/ghostty-vt.wasm");
-    // Wire terminal→PTY writes back to the WebSocket
-    terminal.setWriteCallback((data: Uint8Array) => {
-      transport.send(data);
-    });
-  } catch (err) {
-    console.warn("[app] WASM load error:", err);
-  }
-
   updateGrid();
+  parser = new AnsiParser(renderer.getGrid().cols, renderer.getGrid().rows);
+
   statusText.textContent = "Connecting...";
   setupTransport();
   transport.connect();
@@ -54,7 +44,7 @@ function setupTransport() {
   transport.onEvent((e) => {
     switch (e.type) {
       case "data":
-        terminal.write(e.data);
+        parser.feed(e.data);
         break;
       case "connected":
         connected = true;
@@ -76,7 +66,7 @@ function setupTransport() {
 function updateGrid() {
   const { rows, cols } = renderer.getGrid();
   if (rows > 0 && cols > 0) {
-    terminal.resize(rows, cols);
+    parser?.resize(cols, rows);
     renderer.setGrid(rows, cols);
   }
 }
@@ -84,15 +74,14 @@ function updateGrid() {
 // ── Input ──────────────────────────────────────────────────────────
 function setupInput() {
   document.addEventListener("keydown", (e) => {
-    // Allow browser shortcuts with Meta/Ctrl+Shift
     if (e.metaKey || (e.ctrlKey && e.shiftKey)) return;
     e.preventDefault();
 
-    const encoded = terminal.encodeKey(e.key, e.ctrlKey, e.altKey, e.metaKey);
+    const encoded = encodeKey(e.key, e.ctrlKey, e.altKey);
     if (encoded) transport.send(encoded);
   });
 
-  // IME composition
+  // IME
   const inputEl = document.createElement("input");
   inputEl.style.cssText =
     "position:fixed;top:-100px;left:0;width:1px;height:1px;opacity:0;";
@@ -106,40 +95,54 @@ function setupInput() {
 
   canvas.addEventListener("click", () => inputEl.focus());
 
-  // Paste
   document.addEventListener("paste", (e) => {
     const text = e.clipboardData?.getData("text/plain");
     if (text) transport.send(text);
   });
 
-  // Resize
   let resizeTimer: ReturnType<typeof setTimeout>;
   window.addEventListener("resize", () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-      renderer.resize();
-      updateGrid();
-    }, 100);
+    resizeTimer = setTimeout(updateGrid, 100);
   });
 
-  // Prevent zoom
   document.addEventListener("gesturestart", (e) => e.preventDefault());
+}
+
+function encodeKey(key: string, ctrl: boolean, alt: boolean): string | Uint8Array | null {
+  const text = key.length === 1 ? key : null;
+  if (text && !ctrl && !alt) return text;
+  if (key === "Enter") return "\r";
+  if (key === "Backspace") return "\x7f";
+  if (key === "Tab") return "\t";
+  if (key === "Escape") return "\x1b";
+  if (key === "ArrowUp") return "\x1b[A";
+  if (key === "ArrowDown") return "\x1b[B";
+  if (key === "ArrowRight") return "\x1b[C";
+  if (key === "ArrowLeft") return "\x1b[D";
+  if (key === "Home") return "\x1b[H";
+  if (key === "End") return "\x1b[F";
+  if (key === "PageUp") return "\x1b[5~";
+  if (key === "PageDown") return "\x1b[6~";
+  if (key === "Delete") return "\x1b[3~";
+  if (key === "Insert") return "\x1b[2~";
+  if (ctrl && text && text.length === 1) {
+    const c = text.charCodeAt(0);
+    if (c >= 0x40 && c <= 0x5f) return String.fromCodePoint(c - 0x40);
+    if (c >= 0x61 && c <= 0x7a) return String.fromCodePoint(c - 0x60);
+  }
+  return null;
 }
 
 // ── Render loop ────────────────────────────────────────────────────
 function startRenderLoop() {
   function frame() {
     rafId = requestAnimationFrame(frame);
-
-    // Throttle to ~30fps when idle
-    const rows = terminal.getRenderRows();
-    const cursor = terminal.getCursor();
-    const colors = terminal.getColors();
-
-    renderer.scheduleDraw(rows, cursor, colors);
+    if (parser) {
+      renderer.scheduleDraw(parser.grid, parser.cursorX, parser.cursorY);
+    }
     renderer.drawFrame();
   }
-
   rafId = requestAnimationFrame(frame);
 }
 
@@ -150,5 +153,4 @@ if ("serviceWorker" in navigator) {
   });
 }
 
-// ── Go ─────────────────────────────────────────────────────────────
 init();
