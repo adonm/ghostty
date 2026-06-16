@@ -19,6 +19,27 @@ export interface Cell {
   strikethrough: boolean;
 }
 
+export interface KittyImage {
+  id: number;
+  imageNum: number;
+  total: number;
+  width: number;
+  height: number;
+  cols: number;
+  rows: number;
+  x: number;
+  y: number;
+  z: number;
+  format: number;
+  data: Uint8Array;
+  placementId: number;
+  quiet: boolean;
+  bitmap?: ImageBitmap;
+  loaded?: boolean;
+}
+
+const enum KittyState { Idle, InAPC, HaveData }
+
 export class AnsiParser {
   cols: number;
   rows: number;
@@ -32,9 +53,9 @@ export class AnsiParser {
   private paramStr = "";
   private oscStr = "";
   private oscTerminated = false;
-  private defaultFg = 7;  // ANSI white
-  private defaultBg = 0;  // ANSI black
-  
+  private defaultFg = 7;
+  private defaultBg = 0;
+
   // Current SGR state
   private currentFg = -1;
   private currentBg = -1;
@@ -45,6 +66,18 @@ export class AnsiParser {
   private currentDim = false;
   private currentBlink = false;
   private currentStrikethrough = false;
+
+  // Kitty graphics state
+  private kittyState: KittyState = KittyState.Idle;
+  private kittyChunk = "";
+  private kittyFormat = 0;
+  private kittyImageId = 0;
+  private kittyImageNum = 0;
+  private kittyImageTotal = 0;
+  private kittyPayload = new Uint8Array(0);
+
+  /** Callback when a Kitty graphics image is fully received. */
+  onKittyImage: ((img: KittyImage) => void) | null = null;
 
   constructor(cols: number, rows: number) {
     this.cols = cols;
@@ -123,6 +156,9 @@ export class AnsiParser {
       case ParserState.OscString:
         this.oscString(b);
         break;
+      case ParserState.ApcString:
+        this.apcString(b);
+        break;
     }
   }
 
@@ -173,6 +209,11 @@ export class AnsiParser {
       this.cursorX = this.savedX;
       this.cursorY = this.savedY;
       this.state = ParserState.Ground;
+    } else if (b === 0x5f) {
+      // ESC _ — APC (Kitty graphics protocol)
+      this.state = ParserState.ApcString;
+      this.kittyChunk = "";
+      this.kittyState = KittyState.Idle;
     } else if (b === 0x44) {
       // ESC D — index (scroll down if at bottom)
       this.lineFeed();
@@ -252,6 +293,115 @@ export class AnsiParser {
     } else if (b >= 0x20) {
       this.oscStr += String.fromCodePoint(b);
     }
+  }
+
+  // ── Kitty graphics protocol (APC) ────────────────────────────
+  private apcString(b: number): void {
+    if (b === 0x1b) {
+      // ESC — possible ST start
+      this.kittyState = KittyState.InAPC;
+      return;
+    }
+    if (this.kittyState === KittyState.InAPC && b === 0x5c) {
+      // ST (ESC \) — end of APC
+      this.processKitty(this.kittyChunk);
+      this.state = ParserState.Ground;
+      this.kittyState = KittyState.Idle;
+      return;
+    }
+    if (b === 0x07) {
+      // BEL — alternative terminator
+      this.processKitty(this.kittyChunk);
+      this.state = ParserState.Ground;
+      this.kittyState = KittyState.Idle;
+      return;
+    }
+    this.kittyState = KittyState.HaveData;
+    if (b >= 0x20 && b < 0x7f) {
+      this.kittyChunk += String.fromCodePoint(b);
+    }
+  }
+
+  private processKitty(chunk: string): void {
+    // Parse key=value pairs separated by commas
+    const parts = chunk.split(";");
+    if (parts.length < 2) return;
+    
+    const params: Record<string, string> = {};
+    for (const part of parts) {
+      const eq = part.indexOf("=");
+      if (eq < 0) continue;
+      params[part.slice(0, eq)] = part.slice(eq + 1);
+    }
+
+    const action = params["a"];
+    if (!action) return;
+
+    switch (action) {
+      case "T": // transmit image data
+      case "t": {
+        const format = parseInt(params["f"] || "32");
+        // f=100: PNG (chunked in multiple APC sequences)
+        // f=24: direct PNG in single payload
+        const isPNG = format === 100 || format === 24;
+        if (!isPNG) return;
+
+        const payload = params["s"] || "";
+        const isBase64 = !params["o"] || params["o"] === "z";
+        let data: Uint8Array;
+        try {
+          data = isBase64 
+            ? Uint8Array.from(atob(payload), c => c.charCodeAt(0))
+            : new TextEncoder().encode(payload);
+        } catch { return; }
+        if (data.length === 0) return;
+
+        // Check if chunked
+        const m = parseInt(params["m"] || "0");
+        if (m > 0) {
+          // Chunked: m=1 means more chunks follow, m=0 means last chunk
+          const tmp = new Uint8Array(this.kittyPayload.length + data.length);
+          tmp.set(this.kittyPayload);
+          tmp.set(data, this.kittyPayload.length);
+          this.kittyPayload = tmp;
+          if (m === 0) {
+            // Last chunk — process complete image
+            this.emitKittyImage(params, this.kittyPayload, format);
+            this.kittyPayload = new Uint8Array(0);
+          }
+        } else {
+          // Single payload
+          this.emitKittyImage(params, data, format);
+        }
+        break;
+      }
+      case "p": // query (ignore)
+      case "q": // query response (ignore)
+        break;
+    }
+  }
+
+  private emitKittyImage(params: Record<string, string>, data: Uint8Array, format: number): void {
+    if (!this.onKittyImage) return;
+
+    const img: KittyImage = {
+      id: parseInt(params["i"] || "0"),
+      imageNum: parseInt(params["I"] || "0") || 1,
+      total: parseInt(params["n"] || "0") || 1,
+      width: parseInt(params["w"] || "0"),
+      height: parseInt(params["h"] || "0"),
+      cols: parseInt(params["c"] || "0"),
+      rows: parseInt(params["r"] || "0"),
+      x: parseInt(params["x"] || "0"),
+      y: parseInt(params["y"] || "0"),
+      z: parseInt(params["z"] || "0"),
+      format,
+      data,
+      placementId: parseInt(params["p"] || "0"),
+      quiet: params["q"] === "2",
+    };
+
+    this.onKittyImage(img);
   }
 
   private executeCsi(finalByte: number): void {
@@ -469,6 +619,7 @@ const enum ParserState {
   CsiParam,
   CsiIntermediate,
   OscString,
+  ApcString,
 }
 
 // ── ANSI color mapping ────────────────────────────────────────────

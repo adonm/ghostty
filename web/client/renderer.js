@@ -6,19 +6,21 @@
  * for the future (font atlas textures, shader effects).
  */
 
-import type { Cell } from "./ansi.js";
+import type { Cell, KittyImage } from "./ansi.js";
 import { ansiColorToRgb } from "./ansi.js";
 
 interface RendererConfig {
   fontWidth: number;
   fontHeight: number;
   devicePixelRatio: number;
+  background: [number, number, number];
 }
 
 const DEFAULT_CONFIG: RendererConfig = {
   fontWidth: 8.4,
   fontHeight: 16,
   devicePixelRatio: window.devicePixelRatio || 1,
+  background: [0x1a, 0x1a, 0x2e],
 };
 
 export class TerminalRenderer {
@@ -39,6 +41,9 @@ export class TerminalRenderer {
   // Font measurement
   private charWidth: number;
   private charHeight: number;
+
+  // Kitty graphics images
+  private kittyImages: Map<number, KittyImage> = new Map();
 
   constructor(canvas: HTMLCanvasElement, config?: Partial<RendererConfig>) {
     this.canvas = canvas;
@@ -94,6 +99,21 @@ export class TerminalRenderer {
     this.cursorX = cx;
     this.cursorY = cy;
     this.needsDraw = true;
+  }
+
+  /** Add or update a Kitty graphics image. Decodes PNG via browser. */
+  addKittyImage(img: KittyImage): void {
+    this.kittyImages.set(img.id, img);
+    if (img.format === 100 || img.format === 24) {
+      const blob = new Blob([img.data], { type: "image/png" });
+      createImageBitmap(blob).then((bitmap) => {
+        img.bitmap = bitmap;
+        img.loaded = true;
+        this.needsDraw = true;
+      }).catch((err) => {
+        console.warn("[renderer] kitty decode failed:", err);
+      });
+    }
   }
 
   drawFrame(): void {
@@ -153,6 +173,16 @@ export class TerminalRenderer {
           }
         }
       }
+    }
+
+    // Draw Kitty graphics images
+    for (const img of this.kittyImages.values()) {
+      if (!img.loaded || !img.bitmap) continue;
+      const ix = img.x * cw;
+      const iy = img.y * ch;
+      const iw = (img.cols || Math.ceil(img.bitmap.width / cw)) * cw;
+      const ih = (img.rows || Math.ceil(img.bitmap.height / ch)) * ch;
+      ctx.drawImage(img.bitmap, ix, iy, iw, ih);
     }
 
     // Draw cursor

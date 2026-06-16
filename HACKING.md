@@ -493,3 +493,18 @@ will become difficult to manage. The port that is needed to access the VM may
 change depending on the test.
 
 None of the users in the VM have passwords so do not expose these VMs to the Internet.
+
+## Web Frontend (PWA)
+
+Ghostty includes an experimental web-based remote terminal frontend under `web/`. It
+uses a Deno HTTP/WebSocket server and a Zig PTY bridge (`src/pty_bridge.zig`) to
+serve terminal sessions to browsers as a Progressive Web App.
+
+```shell
+./web/build.sh --serve   # auto-downloads zig+deno, builds, starts server
+# Open http://localhost:9090
+```
+
+The client uses a pure-JS ANSI/VT parser (`web/client/ansi.js`) with Canvas2D rendering
+and supports Kitty graphics protocol for inline images. The PTY bridge intercepts
+terminal queries (DSR, DA) so bash starts without hanging.

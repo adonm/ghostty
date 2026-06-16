@@ -31,6 +31,9 @@ async function init() {
   updateGrid();
   parser = new AnsiParser(renderer.getGrid().cols, renderer.getGrid().rows);
 
+  // Wire Kitty graphics images to the renderer
+  parser.onKittyImage = (img) => renderer.addKittyImage(img);
+
   statusText.textContent = "Connecting...";
   setupTransport();
   transport.connect();
